@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NanoBanana · 图片生成</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#f6f5ef;color:#24271e;font-family:system-ui,"Microsoft YaHei",sans-serif}main{max-width:1080px;margin:60px auto;padding:0 24px}.tag{font-size:13px;letter-spacing:2px;color:#66704c}h1{font-size:38px;margin:12px 0}header p{color:#73776a;line-height:1.7}.workspace{display:grid;grid-template-columns:360px 1fr;gap:24px;margin-top:32px}.panel{background:#fff;border:1px solid #e6e7de;border-radius:20px;padding:28px}label{display:block;font-weight:600;margin-bottom:12px}textarea,select{width:100%;font:inherit;background:#fafbf7;border:1px solid #daddd0;border-radius:10px;padding:12px;color:inherit}textarea{height:190px;resize:vertical;line-height:1.6}select{margin-bottom:20px}textarea{margin-bottom:24px}button,.download{display:block;width:100%;padding:14px;border:0;border-radius:10px;background:#cfe76c;color:#25300d;font:inherit;font-weight:600;cursor:pointer;text-align:center;text-decoration:none}button:disabled{opacity:.6;cursor:wait}.note{font-size:12px;line-height:1.7;color:#828777}.preview{min-height:440px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:18px;text-align:center}.placeholder{font-size:52px}#result{max-width:100%;max-height:620px;border-radius:12px}#message{line-height:1.7;white-space:pre-wrap;color:#657044}#message.error{color:#b33838}.download{max-width:220px;background:#eef1e3}[hidden]{display:none!important}@media(max-width:760px){main{margin:30px auto}.workspace{grid-template-columns:1fr}h1{font-size:30px}.preview{min-height:280px}}
+  </style>
+  <script src="/app.js" defer></script>
+</head>
+<body><main>
+  <header><div class="tag">NANOBANANA / 创意画布</div><h1>把想象，变成画面。</h1><p>写下你的灵感，让 NanoBanana 为你生成图片。</p></header>
+  <div class="workspace">
+    <form id="form" class="panel">
+      <label for="prompt">画面描述</label>
+      <textarea id="prompt" maxlength="4000" required placeholder="描述主体、场景、风格和光线…">一只戴着宇航员头盔的橘猫</textarea>
+      <label for="size">图片尺寸</label>
+      <select id="size"><option value="1024x1024">1024 × 1024 · 方形</option><option value="1024x1536">1024 × 1536 · 竖向</option><option value="1536x1024">1536 × 1024 · 横向</option></select>
+      <button id="generate" type="submit" disabled>生成图片</button>
+      <p id="key-status" class="note">正在检查 API 配置…</p>
+      <p class="note">每次生成会调用远程 API，可能产生费用。图片自动保存在项目 outputs 文件夹。尺寸支持以服务商实际能力为准。</p>
+    </form>
+    <section class="panel preview" aria-label="生成结果" aria-busy="false" id="preview">
+      <div id="placeholder" class="placeholder" aria-hidden="true">✦</div>
+      <div id="message" role="status" aria-live="polite">你的下一张作品，从一句描述开始。</div>
+      <img id="result" alt="AI 生成的图片" hidden>
+      <a id="download" class="download" hidden>下载图片</a>
+    </section>
+  </div>
+</main></body></html>
