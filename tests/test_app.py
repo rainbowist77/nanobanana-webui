@@ -1,4 +1,5 @@
 import base64
+from datetime import datetime
 import io
 import json
 from pathlib import Path
@@ -32,11 +33,30 @@ class ConfiguredTest(unittest.TestCase):
 
 class GenerationTests(ConfiguredTest):
 
+    def test_timestamp_collision_does_not_overwrite_existing_images(self):
+        fixed_time = datetime(2026, 10, 30, 12, 34, 56, 123456)
+        stem = '20261030_123456_123456'
+        def response(*args, **kwargs):
+            return io.BytesIO(json.dumps({'data': [{'b64_json': base64.b64encode(PNG).decode()}]}).encode())
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as directory:
+            output = Path(directory)
+            (output / (stem + '.png')).write_bytes(b'existing')
+            with patch.object(app, 'OUTPUTS', output), patch.object(app, 'datetime') as clock, patch.object(app, 'urlopen', side_effect=response):
+                clock.now.return_value = fixed_time
+                first = app.generate_image('cat', '1024x1024')
+                second = app.generate_image('cat', '1024x1024')
+            self.assertEqual(first, stem + '_1.png')
+            self.assertEqual(second, stem + '_2.png')
+            self.assertEqual((output / (stem + '.png')).read_bytes(), b'existing')
+            self.assertEqual((output / first).read_bytes(), PNG)
+            self.assertEqual((output / second).read_bytes(), PNG)
+
     def test_base64_saved_and_payload_matches_example(self):
         response = io.BytesIO(json.dumps({'data': [{'b64_json': base64.b64encode(PNG).decode()}]}).encode())
         with tempfile.TemporaryDirectory(dir=app.ROOT) as directory:
             with patch.object(app, 'OUTPUTS', Path(directory)), patch.object(app, 'urlopen', return_value=response) as remote:
                 filename = app.generate_image('橘猫', '1024x1024')
+                self.assertRegex(filename, r'^[0-9]{8}_[0-9]{6}_[0-9]{6}\.png$')
                 self.assertEqual((Path(directory) / filename).read_bytes(), PNG)
                 request = remote.call_args.args[0]
                 self.assertEqual(request.full_url, self.config['endpoint'])
@@ -119,6 +139,17 @@ class WebTests(ConfiguredTest):
             with urlopen(self.url + route) as response:
                 self.assertEqual(response.status, 200)
                 self.assertTrue(response.read())
+
+    def test_image_routes_accept_timestamp_and_legacy_names(self):
+        with tempfile.TemporaryDirectory(dir=app.ROOT) as directory:
+            with patch.object(app, 'OUTPUTS', Path(directory)):
+                for name in ('20261030_123456_123456.png', '20261030_123456_123456_1.png', 'a' * 32 + '.png'):
+                    (Path(directory) / name).write_bytes(PNG)
+                    for route in ('images', 'download'):
+                        with self.subTest(name=name, route=route), urlopen(f'{self.url}/{route}/{name}') as response:
+                            self.assertEqual(response.read(), PNG)
+                            self.assertEqual(response.headers.get('Content-Disposition'),
+                                             f'attachment; filename="{name}"' if route == 'download' else None)
 
     def test_status_requires_config_and_does_not_expose_key(self):
         for model, configured in [('', False), ('   ', False), ('custom-model', True)]:

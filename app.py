@@ -3,6 +3,7 @@
 import argparse
 import base64
 import binascii
+from datetime import datetime
 import json
 from pathlib import Path
 import re
@@ -11,7 +12,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
-import uuid
 import webbrowser
 
 
@@ -107,9 +107,20 @@ def generate_image(prompt, size):
             raise GenerationError("API 未返回图片地址或 Base64 图片。")
         extension = image_extension(data)
         OUTPUTS.mkdir(exist_ok=True)
-        filename = uuid.uuid4().hex + extension
-        (OUTPUTS / filename).write_bytes(data)
-        return filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        sequence = 0
+        while True:
+            suffix = f"_{sequence}" if sequence else ""
+            filename = timestamp + suffix + extension
+            try:
+                # Exclusive creation also prevents collisions across processes.
+                file = (OUTPUTS / filename).open("xb")
+            except FileExistsError:
+                sequence += 1
+                continue
+            with file:
+                file.write(data)
+            return filename
     except HTTPError as exc:
         messages = {401: "API Key 无效或已过期。", 403: "API 拒绝访问，请检查账户权限。",
                     429: "请求过于频繁或额度不足，请稍后重试。"}
@@ -162,7 +173,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"configured": True})
             except GenerationError as exc:
                 self.send_json(200, {"configured": False, "error": str(exc)})
-        elif re.fullmatch(r"/(images|download)/[a-f0-9]{32}\.(png|jpg|webp|gif)", path):
+        elif re.fullmatch(r"/(images|download)/(?:[a-f0-9]{32}|[0-9]{8}_[0-9]{6}_[0-9]{6}(?:_[0-9]+)?)\.(png|jpg|webp|gif)", path):
             name = path.rsplit("/", 1)[1]
             file = OUTPUTS / name
             if not file.is_file():
