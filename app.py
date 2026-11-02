@@ -4,14 +4,17 @@ import argparse
 import base64
 import binascii
 from datetime import datetime
+from http.client import HTTPException, IncompleteRead
 import json
 from pathlib import Path
 import re
+import socket
+import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 import webbrowser
 
 
@@ -25,6 +28,39 @@ GENERATING = threading.Lock()
 
 class GenerationError(Exception):
     pass
+
+
+class SafeRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.has_header("Authorization"):
+            raise GenerationError(f"API 请求收到 HTTP {code} 重定向，已阻止以保护密钥；请将 endpoint 改为最终接口地址。")
+        target = urlsplit(newurl)
+        if target.scheme != "https" or not target.hostname or target.username is not None or target.password is not None:
+            raise GenerationError("图片下载重定向被阻止：目标必须是无内嵌凭据的 HTTPS 地址。")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+urlopen = build_opener(SafeRedirectHandler()).open
+
+
+def upstream_detail(error, secrets):
+    # Only show bounded JSON error fields, never raw HTML or response headers.
+    try:
+        with error:
+            body = json.loads(error.read(4096))
+        detail = body.get("error", body) if isinstance(body, dict) else None
+        if isinstance(detail, dict):
+            detail = "; ".join(str(detail[key]) for key in ("code", "message", "param")
+                               if isinstance(detail.get(key), (str, int)))
+        if not isinstance(detail, str):
+            return ""
+        for secret in secrets:
+            if secret:
+                detail = detail.replace(secret, "[已隐藏]")
+        detail = re.sub(r"https?://\S+", "[地址已隐藏]", detail)
+        return " 服务商说明：" + " ".join(detail.split())[:300] if detail else ""
+    except (ValueError, OSError, HTTPException):
+        return ""
 
 
 def load_config():
@@ -85,19 +121,27 @@ def generate_image(prompt, size):
     request = Request(config["endpoint"], data=payload, headers={
         "Authorization": f"Bearer {config['api_key']}", "Content-Type": "application/json",
     }, method="POST")
+    stage = f"API 请求（{urlsplit(config['endpoint']).hostname}）"
     try:
         with urlopen(request, timeout=180) as response:
-            result = json.loads(read_limited(response))
+            raw = read_limited(response)
+        stage = "API 响应解析"
+        result = json.loads(raw)
         items = result.get("data") if isinstance(result, dict) else None
         if not isinstance(items, list) or not items or not isinstance(items[0], dict):
             raise GenerationError("API 返回格式异常：缺少 data[0] 图片信息。")
         item = items[0]
         if item.get("b64_json"):
+            stage = "Base64 图片解码"
             data = base64.b64decode(item["b64_json"], validate=True)
         elif item.get("url"):
             url = item["url"]
-            if not isinstance(url, str) or urlsplit(url).scheme != "https":
-                raise GenerationError("图片下载地址必须使用 HTTPS。")
+            stage = "图片下载地址解析"
+            target = urlsplit(url) if isinstance(url, str) else None
+            if (target is None or target.scheme != "https" or not target.hostname
+                    or target.username is not None or target.password is not None):
+                raise GenerationError("图片下载地址无效：必须是无内嵌凭据的 HTTPS 地址。")
+            stage = f"图片下载（{target.hostname}）"
             # 图片下载请求独立发起，不携带 API Key。
             with urlopen(Request(url), timeout=120) as response:
                 if urlsplit(response.geturl()).scheme != "https":
@@ -105,7 +149,9 @@ def generate_image(prompt, size):
                 data = read_limited(response)
         else:
             raise GenerationError("API 未返回图片地址或 Base64 图片。")
+        stage = "图片格式检查"
         extension = image_extension(data)
+        stage = "图片保存（outputs 目录）"
         OUTPUTS.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         sequence = 0
@@ -122,13 +168,36 @@ def generate_image(prompt, size):
                 file.write(data)
             return filename
     except HTTPError as exc:
-        messages = {401: "API Key 无效或已过期。", 403: "API 拒绝访问，请检查账户权限。",
-                    429: "请求过于频繁或额度不足，请稍后重试。"}
-        raise GenerationError(messages.get(exc.code, f"远程服务请求失败（HTTP {exc.code}）。")) from None
-    except (URLError, TimeoutError, OSError):
-        raise GenerationError("网络连接、图片保存失败或请求超时，请检查网络和目录权限后重试。") from None
+        messages = {400: "请求参数不被接受，请核对模型、尺寸及提示词限制。",
+                    401: "API Key 无效或已过期。" if stage.startswith("API") else "图片下载授权无效或链接已过期。",
+                    403: "访问被拒绝，请检查账户权限或图片链接有效期。",
+                    404: "地址不存在，请核对 endpoint 或图片链接。",
+                    429: "请求频率或账户额度受限。"}
+        hint = messages.get(exc.code, "服务商内部错误。" if exc.code >= 500 else "远程服务拒绝请求。")
+        detail = upstream_detail(exc, (config['api_key'], prompt, config['endpoint']))
+        raise GenerationError(f"{stage}失败：HTTP {exc.code}，{hint}{detail}") from None
+    except IncompleteRead as exc:
+        raise GenerationError(f"{stage}失败：响应传输中断，已收到 {len(exc.partial)} 字节，响应不完整。请检查网络或服务商状态，并确认服务商生成记录后再重试。") from None
+    except (URLError, OSError, HTTPException) as exc:
+        reason = exc.reason if isinstance(exc, URLError) else exc
+        if isinstance(reason, TimeoutError):
+            hint = "连接或读取超时。"
+        elif isinstance(reason, ssl.SSLError):
+            hint = "TLS/证书校验失败，请检查系统时间、证书或代理。"
+        elif isinstance(reason, socket.gaierror):
+            hint = "DNS 解析失败，请检查域名、网络或代理。"
+        elif isinstance(reason, PermissionError):
+            hint = "目录或文件访问被拒绝，请检查写入权限。"
+        else:
+            hint = f"{type(reason).__name__}（系统错误码 {getattr(reason, 'errno', None)}），请检查网络、代理或磁盘状态。"
+        warning = " 请求可能已计费，请先查看服务商记录再重试。" if stage.startswith("API 请求") else ""
+        raise GenerationError(f"{stage}失败：{hint}{warning}") from None
+    except json.JSONDecodeError as exc:
+        raise GenerationError(f"{stage}失败：返回内容不是有效 JSON（第 {exc.lineno} 行，第 {exc.colno} 列）；请核对 endpoint 是否为图片生成接口。") from None
     except (ValueError, TypeError, binascii.Error):
-        raise GenerationError("API 返回的数据无法解析，请稍后重试。") from None
+        raise GenerationError(f"{stage}失败：数据类型或编码无效，请检查服务商返回的图片字段。") from None
+    except GenerationError as exc:
+        raise GenerationError(f"{stage}失败：{exc}") from None
 
 
 class Handler(BaseHTTPRequestHandler):

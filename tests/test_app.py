@@ -1,19 +1,42 @@
 import base64
 from datetime import datetime
+from http.client import IncompleteRead, RemoteDisconnected
 import io
 import json
+import socket
+import ssl
 from pathlib import Path
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import app
 
 
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=')
+
+
+class RedirectTests(unittest.TestCase):
+    def test_api_redirects_are_blocked_before_following(self):
+        handler = app.SafeRedirectHandler()
+        request = Request('https://api.example.com/generate', data=b'{}',
+                          headers={'Authorization': 'Bearer test-key'})
+        for target in ('https://other.example.com/', 'http://api.example.com/', 'https://api.example.com/final'):
+            with self.subTest(target=target), self.assertRaisesRegex(app.GenerationError, 'endpoint'):
+                handler.redirect_request(request, None, 302, 'Found', {}, target)
+
+    def test_image_redirects_require_https(self):
+        handler = app.SafeRedirectHandler()
+        request = Request('https://images.example.com/image.png')
+        for target in ('http://images.example.com/image.png', 'ftp://example.com/image.png', 'https://user:pass@example.com/image.png'):
+            with self.subTest(target=target), self.assertRaises(app.GenerationError):
+                handler.redirect_request(request, None, 302, 'Found', {}, target)
+        redirected = handler.redirect_request(request, None, 302, 'Found', {}, 'https://cdn.example.com/image.png')
+        self.assertEqual(redirected.full_url, 'https://cdn.example.com/image.png')
+        self.assertIsNone(redirected.get_header('Authorization'))
 
 
 class ConfiguredTest(unittest.TestCase):
@@ -32,6 +55,64 @@ class ConfiguredTest(unittest.TestCase):
 
 
 class GenerationTests(ConfiguredTest):
+
+    def test_network_errors_identify_cause(self):
+        for error, expected in ((URLError(socket.gaierror(-2, 'unknown')), 'DNS'),
+                                (URLError(ssl.SSLError('bad certificate')), 'TLS'),
+                                (TimeoutError(), '超时'), (RemoteDisconnected(), 'RemoteDisconnected')):
+            with self.subTest(error=error), patch.object(app, 'urlopen', side_effect=error):
+                with self.assertRaisesRegex(app.GenerationError, expected) as caught:
+                    app.generate_image('cat', '1024x1024')
+                self.assertIn('API 请求', str(caught.exception))
+
+    def test_truncated_responses_identify_stage(self):
+        metadata = io.BytesIO(b'{"data":[{"url":"https://example.com/image.png"}]}')
+        for responses, stage in (([IncompleteRead(b'abc', 10)], 'API 请求'),
+                                 ([metadata, IncompleteRead(b'abc', 10)], '图片下载')):
+            with self.subTest(stage=stage), patch.object(app, 'urlopen', side_effect=responses):
+                with self.assertRaisesRegex(app.GenerationError, stage) as caught:
+                    app.generate_image('cat', '1024x1024')
+                self.assertIn('3 字节', str(caught.exception))
+
+    def test_interruption_during_response_read_is_handled(self):
+        response = io.BytesIO()
+        with patch.object(app, 'urlopen', return_value=response), patch.object(response, 'read', side_effect=IncompleteRead(b'partial', 100)):
+            with self.assertRaisesRegex(app.GenerationError, 'API 请求.*7 字节'):
+                app.generate_image('cat', '1024x1024')
+        self.assertTrue(response.closed)
+
+    def test_parse_decode_and_save_errors_identify_stage(self):
+        for body, stage in ((b'<html>Bad gateway</html>', 'API 响应解析'),
+                            (b'{"data":[{"b64_json":"!!!"}]}', 'Base64 图片解码'),
+                            (b'{"data":[{"b64_json":"YWJj"}]}', '图片格式检查')):
+            with self.subTest(stage=stage), patch.object(app, 'urlopen', return_value=io.BytesIO(body)):
+                with self.assertRaisesRegex(app.GenerationError, stage):
+                    app.generate_image('cat', '1024x1024')
+        body = json.dumps({'data': [{'b64_json': base64.b64encode(PNG).decode()}]}).encode()
+        with patch.object(app, 'urlopen', return_value=io.BytesIO(body)), patch.object(Path, 'mkdir', side_effect=PermissionError()):
+            with self.assertRaisesRegex(app.GenerationError, '图片保存.*访问被拒绝'):
+                app.generate_image('cat', '1024x1024')
+
+    def test_http_error_details_are_bounded_and_redacted(self):
+        body = json.dumps({'error': {'code': 'invalid_model', 'message': 'test-key secret prompt https://example.com/file?token=private ' + 'x' * 400}}).encode()
+        error = HTTPError(self.config['endpoint'], 400, 'Bad Request', {}, io.BytesIO(body))
+        with patch.object(app, 'urlopen', side_effect=error):
+            with self.assertRaises(app.GenerationError) as caught:
+                app.generate_image('secret prompt', '1024x1024')
+        message = str(caught.exception)
+        self.assertIn('HTTP 400', message)
+        self.assertIn('invalid_model', message)
+        for secret in ('test-key', 'secret prompt', 'token=private'):
+            self.assertNotIn(secret, message)
+        self.assertLess(len(message), 450)
+
+    def test_download_http_error_is_not_reported_as_api_key_failure(self):
+        metadata = io.BytesIO(b'{"data":[{"url":"https://example.com/image.png"}]}')
+        error = HTTPError('https://example.com/image.png', 401, 'Unauthorized', {}, None)
+        with patch.object(app, 'urlopen', side_effect=[metadata, error]):
+            with self.assertRaisesRegex(app.GenerationError, '图片下载.*HTTP 401') as caught:
+                app.generate_image('cat', '1024x1024')
+        self.assertNotIn('API Key', str(caught.exception))
 
     def test_timestamp_collision_does_not_overwrite_existing_images(self):
         fixed_time = datetime(2026, 10, 30, 12, 34, 56, 123456)
@@ -183,6 +264,18 @@ class WebTests(ConfiguredTest):
                 data = json.load(response)
                 self.assertEqual(data['download_url'], '/download/' + 'a' * 32 + '.png')
             generate.assert_called_once_with('cat', '1024x1024')
+
+    def test_upstream_interruption_returns_json_and_releases_lock(self):
+        request = Request(self.url + '/api/generate', data=b'{"prompt":"cat"}',
+                          headers={'Origin': self.url, 'Content-Type': 'application/json'})
+        with patch.object(app, 'urlopen', side_effect=IncompleteRead(b'partial', 100)):
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(request)
+            with caught.exception as response:
+                self.assertEqual(response.code, 502)
+                self.assertIn('响应传输中断', json.load(response)['error'])
+        self.assertTrue(app.GENERATING.acquire(blocking=False))
+        app.GENERATING.release()
 
 
 if __name__ == '__main__':
